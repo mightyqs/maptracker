@@ -14,6 +14,8 @@ relocalization benchmark and does not yet use an accumulated LiDAR map.
 - `LocalizationNeck`: projects `[B, 256, 50, 100]` MapTracker BEV features to
   compact normalized descriptors.
 - `RasterMapEncoder`: encodes the existing three-channel nuScenes semantic map.
+- `SemanticDecoder`: reconstructs the map raster from map descriptors and
+  predicts the same semantics from observation descriptors during training.
 - `SE2TemplateMatcher`: evaluates a joint local `x/y/yaw` hypothesis grid.
 - `RasterMapLocalizationHead`: samples a known prior error and supervises the
   pose probability volume.
@@ -51,11 +53,19 @@ bash tools/dist_train.sh \
 ```
 
 This config freezes BEVFormer, disables multi-frame/vector/segmentation
-training, keeps the official `480x800` image size, and trains only the
-localization branch.
+training, keeps the official `480x800` image size, and trains the localization
+neck, map encoder, matcher, and two auxiliary semantic decoders. The visual
+semantic loss reaches the localization neck but not the frozen BEVFormer in
+this quick-validation stage. Set both `freeze_bev=False` and `detach_bev=False`
+for later joint fine-tuning.
 Useful log fields are:
 
 - `loc_nll` and `loc_reg`: optimized localization losses.
+- `map_recon_focal` and `map_recon_dice`: semantic-map reconstruction losses.
+- `bev_sem_focal` and `bev_sem_dice`: visual BEV semantic losses.
+- `loc_map_recon_miou` and `loc_bev_sem_miou`: training-time semantic mIoU.
+- `loc_map_recon_iou_c*` and `loc_bev_sem_iou_c*`: per-channel IoU, where
+  `c0/c1/c2` are pedestrian crossing, divider, and boundary respectively.
 - `loc_exact_acc`: exact hypothesis classification accuracy.
 - `loc_err_x_m`, `loc_err_y_m`, `loc_err_yaw_deg`: MAP hypothesis errors.
 

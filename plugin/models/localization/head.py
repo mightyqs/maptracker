@@ -7,7 +7,11 @@ from .core import (
     LocalizationNeck,
     RasterMapEncoder,
     SE2TemplateMatcher,
+    SemanticDecoder,
     SyntheticLocalizationCore,
+    semantic_dice_loss,
+    semantic_focal_loss,
+    semantic_iou,
 )
 
 
@@ -32,12 +36,23 @@ class RasterMapLocalizationHead(nn.Module):
         synthetic_test_perturbation=False,
         detach_bev=False,
         loss_weight=1.0,
+        map_reconstruction_loss_weight=0.0,
+        bev_semantic_loss_weight=0.0,
+        semantic_focal_loss_weight=1.0,
+        semantic_dice_loss_weight=1.0,
+        semantic_decoder_hidden_channels=None,
     ):
         super().__init__()
         self.synthetic_train_perturbation = bool(synthetic_train_perturbation)
         self.synthetic_test_perturbation = bool(synthetic_test_perturbation)
         self.detach_bev = bool(detach_bev)
         self.loss_weight = float(loss_weight)
+        self.map_reconstruction_loss_weight = float(
+            map_reconstruction_loss_weight
+        )
+        self.bev_semantic_loss_weight = float(bev_semantic_loss_weight)
+        self.semantic_focal_loss_weight = float(semantic_focal_loss_weight)
+        self.semantic_dice_loss_weight = float(semantic_dice_loss_weight)
 
         self.localization_neck = LocalizationNeck(
             in_channels=bev_in_channels,
@@ -49,6 +64,25 @@ class RasterMapLocalizationHead(nn.Module):
             hidden_channels=hidden_channels,
             descriptor_dim=descriptor_dim,
         )
+        decoder_hidden_channels = (
+            hidden_channels
+            if semantic_decoder_hidden_channels is None
+            else int(semantic_decoder_hidden_channels)
+        )
+        self.map_reconstruction_decoder = None
+        if self.map_reconstruction_loss_weight > 0:
+            self.map_reconstruction_decoder = SemanticDecoder(
+                in_channels=descriptor_dim,
+                hidden_channels=decoder_hidden_channels,
+                out_channels=map_in_channels,
+            )
+        self.bev_semantic_decoder = None
+        if self.bev_semantic_loss_weight > 0:
+            self.bev_semantic_decoder = SemanticDecoder(
+                in_channels=descriptor_dim,
+                hidden_channels=decoder_hidden_channels,
+                out_channels=map_in_channels,
+            )
         matcher = SE2TemplateMatcher(
             roi_size=roi_size,
             max_translation=max_translation,
@@ -88,6 +122,71 @@ class RasterMapLocalizationHead(nn.Module):
             target_indices=target_indices,
         )
         if return_loss:
+            semantic_targets = map_raster.to(
+                device=observation.device,
+                dtype=observation.dtype,
+            )
+            output_size = semantic_targets.shape[-2:]
+            if self.map_reconstruction_decoder is not None:
+                map_semantic_logits = self.map_reconstruction_decoder(
+                    map_features,
+                    output_size=output_size,
+                )
+                map_focal = semantic_focal_loss(
+                    map_semantic_logits,
+                    semantic_targets,
+                )
+                map_dice = semantic_dice_loss(
+                    map_semantic_logits,
+                    semantic_targets,
+                )
+                losses['map_recon_focal'] = (
+                    self.map_reconstruction_loss_weight
+                    * self.semantic_focal_loss_weight
+                    * map_focal
+                )
+                losses['map_recon_dice'] = (
+                    self.map_reconstruction_loss_weight
+                    * self.semantic_dice_loss_weight
+                    * map_dice
+                )
+                map_iou, map_iou_per_class = semantic_iou(
+                    map_semantic_logits,
+                    semantic_targets,
+                )
+                outputs['map_reconstruction_iou'] = map_iou
+                outputs['map_reconstruction_iou_per_class'] = map_iou_per_class
+
+            if self.bev_semantic_decoder is not None:
+                bev_semantic_logits = self.bev_semantic_decoder(
+                    observation,
+                    output_size=output_size,
+                )
+                bev_focal = semantic_focal_loss(
+                    bev_semantic_logits,
+                    semantic_targets,
+                )
+                bev_dice = semantic_dice_loss(
+                    bev_semantic_logits,
+                    semantic_targets,
+                )
+                losses['bev_sem_focal'] = (
+                    self.bev_semantic_loss_weight
+                    * self.semantic_focal_loss_weight
+                    * bev_focal
+                )
+                losses['bev_sem_dice'] = (
+                    self.bev_semantic_loss_weight
+                    * self.semantic_dice_loss_weight
+                    * bev_dice
+                )
+                bev_iou, bev_iou_per_class = semantic_iou(
+                    bev_semantic_logits,
+                    semantic_targets,
+                )
+                outputs['bev_semantic_iou'] = bev_iou
+                outputs['bev_semantic_iou_per_class'] = bev_iou_per_class
+
             losses = {
                 name: value * self.loss_weight
                 for name, value in losses.items()

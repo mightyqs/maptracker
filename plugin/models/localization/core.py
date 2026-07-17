@@ -75,6 +75,117 @@ class RasterMapEncoder(nn.Module):
         return F.normalize(descriptors, dim=1, eps=1e-6)
 
 
+class SemanticDecoder(nn.Module):
+    """Decode matching descriptors into dense multi-label map semantics."""
+
+    def __init__(
+        self,
+        in_channels=32,
+        hidden_channels=64,
+        out_channels=3,
+        initial_probability=0.01,
+    ):
+        super().__init__()
+        output_hidden_channels = max(hidden_channels // 2, out_channels)
+        self.input_block = ConvNormAct(in_channels, hidden_channels)
+        self.mid_block = ConvNormAct(hidden_channels, hidden_channels)
+        self.output_block = ConvNormAct(hidden_channels, output_hidden_channels)
+        self.classifier = nn.Conv2d(
+            output_hidden_channels,
+            out_channels,
+            kernel_size=1,
+        )
+        initial_bias = math.log(
+            float(initial_probability) / (1.0 - float(initial_probability))
+        )
+        nn.init.constant_(self.classifier.bias, initial_bias)
+
+    def forward(self, features, output_size):
+        output_height, output_width = (int(v) for v in output_size)
+        feature_height, feature_width = features.shape[-2:]
+        intermediate_size = (
+            min(output_height, feature_height * 2),
+            min(output_width, feature_width * 2),
+        )
+
+        decoded = self.input_block(features)
+        if decoded.shape[-2:] != intermediate_size:
+            decoded = F.interpolate(
+                decoded,
+                size=intermediate_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+        decoded = self.mid_block(decoded)
+        if decoded.shape[-2:] != (output_height, output_width):
+            decoded = F.interpolate(
+                decoded,
+                size=(output_height, output_width),
+                mode='bilinear',
+                align_corners=False,
+            )
+        return self.classifier(self.output_block(decoded))
+
+
+def semantic_focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+    """Sigmoid focal loss for overlapping semantic raster channels."""
+    if logits.shape != targets.shape:
+        raise ValueError(
+            'semantic logits and targets must have the same shape, got '
+            f'{tuple(logits.shape)} and {tuple(targets.shape)}'
+        )
+    targets = targets.to(dtype=logits.dtype)
+    probabilities = logits.sigmoid()
+    probability_correct = (
+        probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+    )
+    alpha_factor = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    focal_weight = alpha_factor * (1.0 - probability_correct).pow(gamma)
+    binary_cross_entropy = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction='none',
+    )
+    return (focal_weight * binary_cross_entropy).mean()
+
+
+def semantic_dice_loss(logits, targets, smooth=1e-5):
+    """Soft Dice loss averaged over samples and semantic channels."""
+    if logits.shape != targets.shape:
+        raise ValueError(
+            'semantic logits and targets must have the same shape, got '
+            f'{tuple(logits.shape)} and {tuple(targets.shape)}'
+        )
+    probabilities = logits.sigmoid().flatten(start_dim=2)
+    targets = targets.to(dtype=logits.dtype).flatten(start_dim=2)
+    intersection = (probabilities * targets).sum(dim=-1)
+    denominator = probabilities.square().sum(dim=-1) + targets.sum(dim=-1)
+    dice = (2.0 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - dice.mean()
+
+
+@torch.no_grad()
+def semantic_iou(logits, targets, threshold=0.5):
+    """Return mean and per-class IoU, ignoring absent classes."""
+    if logits.shape != targets.shape:
+        raise ValueError(
+            'semantic logits and targets must have the same shape, got '
+            f'{tuple(logits.shape)} and {tuple(targets.shape)}'
+        )
+    predictions = logits.sigmoid() >= threshold
+    targets = targets >= 0.5
+    reduce_dims = (0, 2, 3)
+    intersection = (predictions & targets).sum(dim=reduce_dims).float()
+    union = (predictions | targets).sum(dim=reduce_dims).float()
+    per_class = intersection / union.clamp_min(1.0)
+    valid_classes = union > 0
+    if valid_classes.any():
+        mean = per_class[valid_classes].mean()
+    else:
+        mean = per_class.new_tensor(1.0)
+    return mean, per_class
+
+
 def invert_se2(poses):
     """Invert poses stored as forward-x, left-y, counter-clockwise-yaw."""
     dx, dy, yaw = poses.unbind(dim=-1)

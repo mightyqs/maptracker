@@ -37,6 +37,11 @@ model = dict(
         synthetic_test_perturbation=True,
         detach_bev=True,
         loss_weight=1.0,
+        map_reconstruction_loss_weight=1.0,
+        bev_semantic_loss_weight=1.0,
+        semantic_focal_loss_weight=1.0,
+        semantic_dice_loss_weight=1.0,
+        semantic_decoder_hidden_channels=64,
     ),
 )
 

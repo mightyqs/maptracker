@@ -97,20 +97,60 @@ def main():
         map_input,
         output_size=observation_descriptors.shape[-2:],
     )
+    map_decoder = core.SemanticDecoder(
+        in_channels=8,
+        hidden_channels=16,
+        out_channels=3,
+    ).to(device)
+    bev_decoder = core.SemanticDecoder(
+        in_channels=8,
+        hidden_channels=16,
+        out_channels=3,
+    ).to(device)
+    semantic_target = (map_input > 0).to(dtype=map_descriptors.dtype)
+    map_semantic_logits = map_decoder(
+        map_descriptors,
+        output_size=semantic_target.shape[-2:],
+    )
+    bev_semantic_logits = bev_decoder(
+        observation_descriptors,
+        output_size=semantic_target.shape[-2:],
+    )
     encoder_losses, encoder_outputs = localization(
         observation_descriptors,
         map_descriptors,
         synthesize_error=True,
     )
-    encoder_loss = sum(encoder_losses.values())
+    semantic_losses = (
+        core.semantic_focal_loss(map_semantic_logits, semantic_target)
+        + core.semantic_dice_loss(map_semantic_logits, semantic_target)
+        + core.semantic_focal_loss(bev_semantic_logits, semantic_target)
+        + core.semantic_dice_loss(bev_semantic_logits, semantic_target)
+    )
+    encoder_loss = sum(encoder_losses.values()) + semantic_losses
     encoder_loss.backward()
     assert_finite('encoder loss', encoder_loss)
     assert_finite('encoder covariance', encoder_outputs['covariance'])
+    map_iou, map_iou_per_class = core.semantic_iou(
+        map_semantic_logits,
+        semantic_target,
+    )
+    assert_finite('map reconstruction IoU', map_iou)
+    assert_finite('map reconstruction per-class IoU', map_iou_per_class)
+    if map_semantic_logits.shape != semantic_target.shape:
+        raise RuntimeError('map decoder output shape does not match its target')
+    if bev_semantic_logits.shape != semantic_target.shape:
+        raise RuntimeError('BEV decoder output shape does not match its target')
     if not any(parameter.grad is not None for parameter in neck.parameters()):
         raise RuntimeError('localization neck did not receive gradients')
     if not any(parameter.grad is not None for parameter in map_encoder.parameters()):
         raise RuntimeError('map encoder did not receive gradients')
+    if not any(parameter.grad is not None for parameter in map_decoder.parameters()):
+        raise RuntimeError('map semantic decoder did not receive gradients')
+    if not any(parameter.grad is not None for parameter in bev_decoder.parameters()):
+        raise RuntimeError('BEV semantic decoder did not receive gradients')
     print(f'encoder output shape: {tuple(observation_descriptors.shape)}')
+    print(f'semantic output shape: {tuple(map_semantic_logits.shape)}')
     print('localization smoke test passed')
 
 

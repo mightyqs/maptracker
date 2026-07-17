@@ -613,6 +613,30 @@ class MapTracker(BaseMapper):
                 log_vars['loc_err_x_m'] = pose_abs_error[0].item()
                 log_vars['loc_err_y_m'] = pose_abs_error[1].item()
                 log_vars['loc_err_yaw_deg'] = np.rad2deg(pose_abs_error[2].item())
+            map_reconstruction_iou = localization_outputs.get(
+                'map_reconstruction_iou'
+            )
+            if map_reconstruction_iou is not None:
+                log_vars['loc_map_recon_miou'] = map_reconstruction_iou.item()
+            map_iou_per_class = localization_outputs.get(
+                'map_reconstruction_iou_per_class'
+            )
+            if map_iou_per_class is not None:
+                for class_index, class_iou in enumerate(map_iou_per_class):
+                    log_vars[f'loc_map_recon_iou_c{class_index}'] = (
+                        class_iou.item()
+                    )
+            bev_semantic_iou = localization_outputs.get('bev_semantic_iou')
+            if bev_semantic_iou is not None:
+                log_vars['loc_bev_sem_miou'] = bev_semantic_iou.item()
+            bev_iou_per_class = localization_outputs.get(
+                'bev_semantic_iou_per_class'
+            )
+            if bev_iou_per_class is not None:
+                for class_index, class_iou in enumerate(bev_iou_per_class):
+                    log_vars[f'loc_bev_sem_iou_c{class_index}'] = (
+                        class_iou.item()
+                    )
 
         for t, loss_dict_t in enumerate(all_loss_dict_prev):
             log_vars_t = {k+'_t{}'.format(t): v.item() for k, v in loss_dict_t.items()}
