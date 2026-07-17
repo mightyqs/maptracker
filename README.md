@@ -68,6 +68,11 @@ For how to download and prepare data for the nuScenes and Argoverse2 datasets, a
 
 For instructions on how to run training, inference, evaluation, and visualization, please follow [getting started guide](docs/getting_started.md).
 
+This fork also includes an optional localization neck and joint SE(2)
+raster-map matching head. See the
+[localization quickstart](docs/localization_quickstart.md) for its nuScenes
+smoke test, training config, scope, and current limitations.
+
 
 ## Acknowledgements
 

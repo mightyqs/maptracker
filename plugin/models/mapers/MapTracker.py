@@ -29,6 +29,7 @@ class MapTracker(BaseMapper):
                  head_cfg=dict(),
                  neck_cfg=None,
                  seg_cfg=None,
+                 localization_cfg=None,
                  model_name=None, 
                  pretrained=None,
                  history_steps=None,
@@ -41,6 +42,7 @@ class MapTracker(BaseMapper):
                  use_memory=False,
                  mem_len=None,
                  mem_warmup_iters=-1,
+                 localization_only=False,
                  **kwargs):
         super().__init__()
 
@@ -70,6 +72,15 @@ class MapTracker(BaseMapper):
 
         # BEV semantic seg head
         self.seg_decoder = build_head(seg_cfg)
+
+        # Optional raster-map localization head. It consumes the same fused BEV
+        # tensor as the segmentation and vector heads.
+        self.localization_head = (
+            build_head(localization_cfg) if localization_cfg is not None else None
+        )
+        self.localization_only = localization_only
+        if self.localization_only and self.localization_head is None:
+            raise ValueError('localization_only=True requires localization_cfg')
         
         # BEV 
         self.bev_h = bev_h
@@ -532,8 +543,18 @@ class MapTracker(BaseMapper):
             #import pdb; pdb.set_trace()
             ########################################################
 
-        seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(bev_feats, gt_semantic, 
-                all_history_coord, return_loss=True)
+        if self.localization_only:
+            seg_preds = None
+            seg_feats = None
+            seg_loss = bev_feats.new_zeros(())
+            seg_dice_loss = bev_feats.new_zeros(())
+        else:
+            seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(
+                bev_feats,
+                gt_semantic,
+                all_history_coord,
+                return_loss=True,
+            )
         
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if _use_memory else None
@@ -548,8 +569,22 @@ class MapTracker(BaseMapper):
         else:
             loss_dict = {}
         
-        loss_dict['seg'] = seg_loss
-        loss_dict['seg_dice'] = seg_dice_loss
+        if not self.localization_only:
+            loss_dict['seg'] = seg_loss
+            loss_dict['seg_dice'] = seg_dice_loss
+
+        if self.localization_head is not None:
+            localization_losses, localization_outputs = self.localization_head(
+                bev_features=bev_feats,
+                map_raster=gt_semantic,
+                return_loss=True,
+            )
+            loss_dict.update(localization_losses)
+            self.latest_localization_outputs = {
+                key: value.detach()
+                for key, value in localization_outputs.items()
+                if torch.is_tensor(value) and key not in ('logits', 'probabilities')
+            }
 
         # format loss, average over all frames (2 frames for now)
         loss = 0
@@ -567,6 +602,17 @@ class MapTracker(BaseMapper):
         
         # update the log
         log_vars = {k: v.item() for k, v in loss_dict.items()}
+        if self.localization_head is not None:
+            exact_accuracy = localization_outputs.get('exact_accuracy')
+            if exact_accuracy is not None:
+                log_vars['loc_exact_acc'] = exact_accuracy.item()
+            pose_map = localization_outputs.get('pose_map')
+            target_pose = localization_outputs.get('target_pose')
+            if pose_map is not None and target_pose is not None:
+                pose_abs_error = (pose_map - target_pose).abs().mean(dim=0)
+                log_vars['loc_err_x_m'] = pose_abs_error[0].item()
+                log_vars['loc_err_y_m'] = pose_abs_error[1].item()
+                log_vars['loc_err_yaw_deg'] = np.rad2deg(pose_abs_error[2].item())
 
         for t, loss_dict_t in enumerate(all_loss_dict_prev):
             log_vars_t = {k+'_t{}'.format(t): v.item() for k, v in loss_dict_t.items()}
@@ -584,7 +630,8 @@ class MapTracker(BaseMapper):
         return loss, log_vars, num_sample
 
     @torch.no_grad()
-    def forward_test(self, img, points=None, img_metas=None, seq_info=None, **kwargs):
+    def forward_test(self, img, points=None, img_metas=None, seq_info=None,
+                     semantic_mask=None, **kwargs):
         '''
             inference pipeline
         '''
@@ -623,6 +670,15 @@ class MapTracker(BaseMapper):
         img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
         # Neck
         bev_feats = self.neck(_bev_feats)
+
+        localization_outputs = None
+        if self.localization_head is not None and semantic_mask is not None:
+            localization_map = torch.flip(semantic_mask, [2,])
+            localization_outputs = self.localization_head(
+                bev_features=bev_feats,
+                map_raster=localization_map,
+                return_loss=False,
+            )
 
         if self.skip_vector_head or first_frame:
             self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \
@@ -688,6 +744,10 @@ class MapTracker(BaseMapper):
             results_list[b_i]['semantic_mask'] = preds_i
             if 'token' not in results_list[b_i]:
                 results_list[b_i]['token'] = tokens[b_i]
+            if localization_outputs is not None:
+                results_list[b_i]['localization'] = (
+                    self.localization_head.result_for_sample(localization_outputs, b_i)
+                )
 
         return results_list
 
