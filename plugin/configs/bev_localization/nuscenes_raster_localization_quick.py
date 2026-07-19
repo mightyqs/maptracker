@@ -1,5 +1,5 @@
 _base_ = [
-    '../../maptracker/nuscenes_oldsplit/maptracker_nusc_oldsplit_5frame_span10_stage1_bev_pretrain.py'
+    '../maptracker/nuscenes_oldsplit/maptracker_nusc_oldsplit_5frame_span10_stage1_bev_pretrain.py'
 ]
 
 # This config validates the localization branch with synthetic SE(2) prior

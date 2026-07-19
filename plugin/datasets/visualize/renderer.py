@@ -1,6 +1,5 @@
 import os.path as osp
 import os
-import av2.geometry.interpolate as interp_utils
 import numpy as np
 import copy
 import cv2
@@ -30,6 +29,13 @@ def points_ego2img(pts_ego, extrinsics, intrinsics):
     return uv, depth
 
 def draw_polyline_ego_on_img(polyline_ego, img_bgr, extrinsics, intrinsics, color_bgr, thickness):
+    try:
+        import av2.geometry.interpolate as interp_utils
+    except (ImportError, TypeError) as exc:
+        raise RuntimeError(
+            'Camera-view rendering requires a compatible av2 installation.'
+        ) from exc
+
     if polyline_ego.shape[1] == 2:
         zeros = np.zeros((polyline_ego.shape[0], 1))
         polyline_ego = np.concatenate([polyline_ego, zeros], axis=1)
@@ -262,4 +268,3 @@ class Renderer(object):
         else:
             cv2.imwrite(out_path, bev_img.transpose((1, 2, 0)))
             
-        
