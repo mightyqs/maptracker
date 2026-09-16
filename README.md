@@ -391,12 +391,6 @@ python tools/train.py \
 只检查 pipeline 时，将阶段 B 命令的 `--work-dir` 换为新目录，并覆盖
 `runner.max_iters=20 lr_config.warmup_iters=5 checkpoint_config.interval=20`。
 
-游戏等程序会占用同一张显卡，应在 GPU 空闲时比较吞吐和显存。共享 GPU 时可
-覆盖 `data.samples_per_gpu=1 data.workers_per_gpu=0`。batch 1 的 500 次约遍历
-mini-train 1.55 遍；batch 4 的 500 次约 6.2 遍，二者不是相同训练样本预算。
-GPU 空闲时，本机 batch 4 真实裁剪短训练的常规迭代约 0.9 秒，日志显存约 2.3 GB；
-这不是整卡总占用，也不是不同设备上的性能保证。
-
 日志位于输出目录的 `*.log`、`*.log.json`，关键指标包括：
 
 - `loc_nll`、`loc_reg`：定位损失；NLL 使用软标签，不以降到零为目标。
