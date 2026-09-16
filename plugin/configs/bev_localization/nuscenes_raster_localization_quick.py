@@ -20,6 +20,9 @@ model = dict(
     history_steps=0,
     test_time_history_steps=0,
     localization_only=True,
+    backbone_cfg=dict(
+        img_backbone=dict(pretrained=None),
+    ),
     localization_cfg=dict(
         type='RasterMapLocalizationHead',
         bev_in_channels=256,

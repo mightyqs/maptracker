@@ -64,6 +64,11 @@ class FormatBundleMap(object):
                 assert isinstance(results['semantic_mask'], list)
                 results['semantic_mask'] = DC(results['semantic_mask'], stack=False)
 
+        for key in ('localization_map', 'localization_target_pose'):
+            if key in results:
+                results[key] = DC(to_tensor(np.ascontiguousarray(results[key])),
+                                  stack=True, pad_dims=None)
+
         if 'vectors' in results:
             # vectors may have different sizes
             vectors = results['vectors']

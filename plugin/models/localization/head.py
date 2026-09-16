@@ -41,11 +41,13 @@ class RasterMapLocalizationHead(nn.Module):
         semantic_focal_loss_weight=1.0,
         semantic_dice_loss_weight=1.0,
         semantic_decoder_hidden_channels=None,
+        require_prior_map=False,
     ):
         super().__init__()
         self.synthetic_train_perturbation = bool(synthetic_train_perturbation)
         self.synthetic_test_perturbation = bool(synthetic_test_perturbation)
         self.detach_bev = bool(detach_bev)
+        self.require_prior_map = bool(require_prior_map)
         self.loss_weight = float(loss_weight)
         self.map_reconstruction_loss_weight = float(
             map_reconstruction_loss_weight
@@ -103,6 +105,8 @@ class RasterMapLocalizationHead(nn.Module):
         return_loss=True,
         synthetic_perturbation=None,
         target_indices=None,
+        target_pose=None,
+        bev_semantic_target=None,
     ):
         if self.detach_bev:
             bev_features = bev_features.detach()
@@ -115,11 +119,17 @@ class RasterMapLocalizationHead(nn.Module):
                 if return_loss
                 else self.synthetic_test_perturbation
             )
+        if self.require_prior_map:
+            if synthetic_perturbation:
+                raise ValueError('Real map crops must not receive feature-level perturbation')
+            if return_loss and (target_pose is None or bev_semantic_target is None):
+                raise ValueError('Real-crop training needs pose labels and aligned BEV semantic targets')
         losses, outputs = self.core(
             observation=observation,
             map_features=map_features,
             synthesize_error=synthetic_perturbation,
             target_indices=target_indices,
+            target_pose=target_pose,
         )
         if return_loss:
             semantic_targets = map_raster.to(
@@ -158,17 +168,20 @@ class RasterMapLocalizationHead(nn.Module):
                 outputs['map_reconstruction_iou_per_class'] = map_iou_per_class
 
             if self.bev_semantic_decoder is not None:
+                bev_targets = (semantic_targets if bev_semantic_target is None else
+                               bev_semantic_target.to(device=observation.device,
+                                                      dtype=observation.dtype))
                 bev_semantic_logits = self.bev_semantic_decoder(
                     observation,
-                    output_size=output_size,
+                    output_size=bev_targets.shape[-2:],
                 )
                 bev_focal = semantic_focal_loss(
                     bev_semantic_logits,
-                    semantic_targets,
+                    bev_targets,
                 )
                 bev_dice = semantic_dice_loss(
                     bev_semantic_logits,
-                    semantic_targets,
+                    bev_targets,
                 )
                 losses['bev_sem_focal'] = (
                     self.bev_semantic_loss_weight
@@ -182,7 +195,7 @@ class RasterMapLocalizationHead(nn.Module):
                 )
                 bev_iou, bev_iou_per_class = semantic_iou(
                     bev_semantic_logits,
-                    semantic_targets,
+                    bev_targets,
                 )
                 outputs['bev_semantic_iou'] = bev_iou
                 outputs['bev_semantic_iou_per_class'] = bev_iou_per_class

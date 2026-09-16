@@ -413,13 +413,21 @@ class SyntheticLocalizationCore(nn.Module):
         map_features,
         synthesize_error=False,
         target_indices=None,
+        target_pose=None,
     ):
-        target_pose = None
         if synthesize_error:
+            if target_pose is not None:
+                raise ValueError('External target_pose cannot be combined with feature perturbation')
             map_features, target_indices, target_pose = self.synthesize_prior_error(
                 map_features,
                 target_indices,
             )
+        elif target_pose is None and target_indices is not None:
+            target_pose = self.matcher.hypotheses[target_indices].to(observation)
+        if target_pose is not None:
+            target_pose = target_pose.to(device=observation.device, dtype=observation.dtype)
+            if target_pose.shape != (observation.shape[0], 3) or not torch.isfinite(target_pose).all():
+                raise ValueError('target_pose must be finite with shape [B, 3]')
 
         logits = self.matcher(observation, map_features)
         outputs = self.matcher.decode(logits)
@@ -427,7 +435,7 @@ class SyntheticLocalizationCore(nn.Module):
         outputs['target_pose'] = target_pose
 
         losses = {}
-        if target_indices is not None:
+        if target_pose is not None:
             hypothesis_error = self.matcher.hypotheses.to(
                 device=logits.device,
                 dtype=logits.dtype,
@@ -446,6 +454,11 @@ class SyntheticLocalizationCore(nn.Module):
                 self.matcher.yaw_step,
             ])
             squared_bin_error = (hypothesis_error / bin_scale).square().sum(dim=-1)
+            nearest_indices = squared_bin_error.argmin(dim=-1)
+            if target_indices is not None and not torch.equal(target_indices, nearest_indices):
+                raise ValueError('target_indices disagree with target_pose')
+            target_indices = nearest_indices
+            outputs['target_indices'] = target_indices
             soft_targets = torch.softmax(
                 -0.5 * squared_bin_error / (self.label_sigma_bins ** 2),
                 dim=-1,
@@ -468,6 +481,7 @@ class SyntheticLocalizationCore(nn.Module):
                 pose_error / scale,
                 torch.zeros_like(pose_error),
             )
+            # For continuous targets this is nearest-grid classification accuracy.
             outputs['exact_accuracy'] = (
                 logits.argmax(dim=-1) == target_indices
             ).float().mean()

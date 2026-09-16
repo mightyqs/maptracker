@@ -28,6 +28,8 @@ class RasterizeMap(object):
                  thickness: int, 
                  coords_dim: int,
                  semantic_mask=False,
+                 geometry_key='map_geoms',
+                 output_key='semantic_mask',
                  ):
 
         self.roi_size = roi_size
@@ -37,6 +39,8 @@ class RasterizeMap(object):
         self.thickness = thickness
         self.coords_dim = coords_dim
         self.semantic_mask = semantic_mask
+        self.geometry_key = geometry_key
+        self.output_key = output_key
 
     def line_ego_to_mask(self, 
                          line_ego: LineString, 
@@ -150,10 +154,10 @@ class RasterizeMap(object):
             return instance_masks
 
     def __call__(self, input_dict: Dict) -> Dict:
-        map_geoms = input_dict['map_geoms'] # {0: List[ped_crossing: LineString], 1: ...}
+        map_geoms = input_dict[self.geometry_key]
 
         semantic_mask = self.get_semantic_mask(map_geoms)
-        input_dict['semantic_mask'] = semantic_mask # (num_class, canvas_size[1], canvas_size[0])
+        input_dict[self.output_key] = semantic_mask # (num_class, canvas_size[1], canvas_size[0])
         return input_dict
     
     def __repr__(self):

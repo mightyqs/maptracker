@@ -353,7 +353,8 @@ class MapTracker(BaseMapper):
         
 
     def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
-                      all_local2global_info=None, **kwargs):
+                      all_local2global_info=None, localization_map=None,
+                      localization_target_pose=None, **kwargs):
         '''
         Args:
             img: torch.Tensor of shape [B, N, 3, H, W]
@@ -574,10 +575,15 @@ class MapTracker(BaseMapper):
             loss_dict['seg_dice'] = seg_dice_loss
 
         if self.localization_head is not None:
+            if self.localization_head.require_prior_map and localization_map is None:
+                raise ValueError('Real-crop localization requires localization_map from the dataset')
             localization_losses, localization_outputs = self.localization_head(
                 bev_features=bev_feats,
-                map_raster=gt_semantic,
+                map_raster=(gt_semantic if localization_map is None else localization_map.flip(2)),
                 return_loss=True,
+                synthetic_perturbation=False if localization_map is not None else None,
+                target_pose=localization_target_pose,
+                bev_semantic_target=gt_semantic,
             )
             loss_dict.update(localization_losses)
             self.latest_localization_outputs = {
@@ -655,7 +661,8 @@ class MapTracker(BaseMapper):
 
     @torch.no_grad()
     def forward_test(self, img, points=None, img_metas=None, seq_info=None,
-                     semantic_mask=None, **kwargs):
+                     semantic_mask=None, localization_map=None,
+                     localization_target_pose=None, **kwargs):
         '''
             inference pipeline
         '''
@@ -696,12 +703,16 @@ class MapTracker(BaseMapper):
         bev_feats = self.neck(_bev_feats)
 
         localization_outputs = None
-        if self.localization_head is not None and semantic_mask is not None:
-            localization_map = torch.flip(semantic_mask, [2,])
+        if self.localization_head is not None and self.localization_head.require_prior_map and localization_map is None:
+            raise ValueError('Real-crop localization requires localization_map from the dataset')
+        if self.localization_head is not None and (localization_map is not None or semantic_mask is not None):
+            prior_map = localization_map if localization_map is not None else semantic_mask
             localization_outputs = self.localization_head(
                 bev_features=bev_feats,
-                map_raster=localization_map,
+                map_raster=prior_map.flip(2),
                 return_loss=False,
+                synthetic_perturbation=False if localization_map is not None else None,
+                target_pose=localization_target_pose,
             )
 
         if self.skip_vector_head or first_frame:

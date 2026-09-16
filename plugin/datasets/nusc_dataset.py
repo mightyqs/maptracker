@@ -1,5 +1,6 @@
 from.base_dataset import BaseMapDataset
 from .map_utils.nuscmap_extractor import NuscMapExtractor
+from .map_utils.localization_prior import lidar_global_pose, prior_map_query, sample_correction
 from mmdet.datasets import DATASETS
 import numpy as np
 from .visualize.renderer import Renderer
@@ -25,10 +26,31 @@ class NuscDataset(BaseMapDataset):
         test_mode (bool): whether in test mode
     """
     
-    def __init__(self, data_root, **kwargs):
+    def __init__(self, data_root, localization_prior=None, **kwargs):
+        self.localization_prior = localization_prior
+        self.localization_test_mode = kwargs.get('test_mode', False)
         super().__init__(**kwargs)
         self.map_extractor = NuscMapExtractor(data_root, self.roi_size)
         self.renderer = Renderer(self.cat2id, self.roi_size, 'nusc')
+
+    def get_localization_prior(self, idx, target_pose=None):
+        """Query global map geometry at P=G@inv(C), without touching camera poses."""
+        sample = self.samples[idx]
+        if target_pose is None:
+            if self.localization_prior is None:
+                raise ValueError('Configure localization_prior or provide target_pose')
+            target_pose = sample_correction(self.localization_prior, sample['token'],
+                                            self.localization_test_mode)
+        translation, rotation = lidar_global_pose(sample)
+        query = prior_map_query(translation, rotation, target_pose)
+        geometries = self.map_extractor.get_map_geom(
+            sample['location'], query['translation'], query['rotation'])
+        return dict(
+            localization_map_geoms={label: geometries[name] for name, label in self.cat2id.items()},
+            localization_target_pose=np.asarray(target_pose, dtype=np.float32),
+            localization_prior_global_pose=query['prior_global_pose'],
+            localization_observation_global_pose=query['observation_global_pose'],
+        )
     
     def load_annotations(self, ann_file):
         """Load annotations from ann_file.
@@ -151,4 +173,6 @@ class NuscDataset(BaseMapDataset):
             'lidar2ego_rotation': sample['lidar2ego_rotation'],
         }
 
+        if self.localization_prior is not None:
+            input_dict.update(self.get_localization_prior(idx))
         return input_dict
