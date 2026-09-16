@@ -129,7 +129,7 @@ $$
 对于候选 `C_k=(t_x,t_y,theta)`，在观测网格位置 `q=(x,y)` 查询先验地图：
 
 $$
-q'=R(\theta)q+t, \qquad \widetilde D_k(q)=\operatorname{bilinear}(D,q').
+q'=R(\theta)q+t, \qquad \widetilde D_k(q)=\mathrm{bilinear}(D,q').
 $$
 
 `grid_sample` 实现这个 output-to-input 采样，采用双线性插值、零填充和
@@ -138,7 +138,7 @@ $$
 $$
 s_k=\frac{\sum_q v_k(q)\, O(q)^\top\widetilde D_k(q)}
 {\max(1,\sum_q v_k(q))}, \qquad
-p_k=\operatorname{softmax}_k(\alpha s_k).
+p_k=\mathrm{softmax}_k(\alpha s_k).
 $$
 
 其中 `alpha=clamp(exp(logit_scale), max=100)` 是可学习的分数尺度，初值为 10。
@@ -157,7 +157,7 @@ $$
 
 $$
 \bar t=\sum_k p_k t_k, \qquad
-\bar\theta=\operatorname{atan2}\left(\sum_k p_k\sin\theta_k,
+\bar\theta=\mathrm{atan2}\left(\sum_k p_k\sin\theta_k,
 \sum_k p_k\cos\theta_k\right).
 $$
 
@@ -179,7 +179,7 @@ MapTracker 历史记忆、地图融合或外部状态估计器。
 `b=(1.2 m, 1.2 m, 2°)` 归一化候选误差，其中 yaw 差做角度环绕：
 
 $$
-y_k=\operatorname{softmax}_k\left(-\frac{\|(c_k-c^*)/b\|^2}{2\sigma^2}\right),
+y_k=\mathrm{softmax}_k\left(-\frac{\|(c_k-c^*)/b\|^2}{2\sigma^2}\right),
 \qquad L_{nll}=-\sum_k y_k\log p_k, \qquad \sigma=0.75.
 $$
 
