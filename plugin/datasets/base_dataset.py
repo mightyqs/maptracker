@@ -44,6 +44,7 @@ class BaseMapDataset(Dataset):
                  sampling_span=10,
                  matching=False,
                  eval_semantic=False,
+                 matching_file=None,
         ):
         super().__init__()
         self.ann_file = ann_file
@@ -63,7 +64,7 @@ class BaseMapDataset(Dataset):
 
         if matching:
             assert self.multi_frame, 'The matching info has to loaded under the multi-frame setting'
-            self.matching_file = ann_file[:-4] + '_gt_tracks.pkl'
+            self.matching_file = matching_file or ann_file[:-4] + '_gt_tracks.pkl'
             assert os.path.isfile(self.matching_file)
             self.load_matching(self.matching_file)
         
@@ -481,6 +482,10 @@ class BaseMapDataset(Dataset):
             all_local2global_info = []
             if self.matching:
                 scene_matching_info = self.matching_meta[scene_name]
+                if (data['img_metas'].data.get('observation_modality') == 'lidar' and
+                        scene_matching_info.get('coordinate_frame') != 'lidar_planar_map_xy'):
+                    raise ValueError('LiDAR temporal training requires LiDAR map-frame GT tracks; '
+                                     'run tools/mapping/prepare_lidar_tracks.py')
                 for local_idx_prev in local_indices_prev:
                     prev_local2global = DC(scene_matching_info['instance_ids'][local_idx_prev], cpu_only=True)
                     all_local2global_info.append(prev_local2global)

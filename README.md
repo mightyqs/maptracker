@@ -1,22 +1,95 @@
-# 基于 MapTracker 的地图定位与联合建图探索
+# 基于 MapTracker 的 LiDAR 在线建图与地图定位
 
-本仓库在 [MapTracker](https://github.com/woodfrog/maptracker) 上增加了图像 BEV 与
-先验语义地图之间的局部定位分支。输入当前帧六相机图像、已有地图和带误差的
-初始位姿，预测平面位置及航向修正。最终目标是让定位与在线建图共享 BEV
-表征并联合训练。
+本仓库基于 [MapTracker](https://github.com/woodfrog/maptracker)，接入 BEVFusion 风格的
+LiDAR 前端，并在共享 BEV 上增加先验地图匹配定位。当前推荐流程是：
+**预训练 LiDAR 前端 → 多帧向量建图 → 冻结 BEV → 局部 SE(2) 定位**。
+定位输入点云、已有语义地图及带误差的初始位姿，输出 x/y/yaw 修正。
+最终目标是让定位与在线建图共享表征并联合训练；原六相机分支保留用于对照。
 
-**当前重点是单帧局部 SE(2) 定位。** 已跑通 nuScenes mini 的训练、固定扰动
-验证、图像错配对照，以及按带误差位姿重新查询全局地图的裁剪路径。当前定位
-配置冻结 BEV 主干、关闭历史与向量头训练；尚未验证在线建图联合训练。
+**相机分支已实现单帧局部 SE(2) 定位。** 已跑通 nuScenes mini 的训练、固定扰动
+验证、图像错配对照，以及按带误差位姿重新查询全局地图的裁剪路径。当前
+相机定位配置冻结 BEV 主干、关闭历史与向量头训练；尚未验证在线建图联合训练。
+
+2026-09-19 新增 **LiDAR 单帧前端**：对照 MIT-HAN-Lab BEVFusion，将点云经过
+体素化、SparseEncoder、SECOND 和 SECONDFPN 转为共享 BEV，复用现有向量头与
+定位 neck。提供本机小网格、上游原生网格和单帧联合损失三种配置；历史相机成绩
+不代表 LiDAR 精度。源码对照、坐标约定和训练验证命令见
+[LiDAR 前端说明](docs/lidar_frontend.md)。下文原有算法尺寸和实验表主要描述相机分支。
+
+当前新增 [LiDAR 纯建图验证](docs/lidar_online_mapping.md)：关闭定位头与先验地图查询，
+单独训练语义/向量建图，并用连续 LiDAR 帧验证相对位姿下的 query 传播与实例 ID。
+现已接入原版的 [LiDAR 历史 query 联合训练](docs/lidar_history_queries.md)：支持两帧与
+五帧窗口、跨帧 GT 实例匹配、MotionMLP、历史/新 query 联合解码和双向变换损失。
+历史 BEV 融合与长时记忆库尚未接入；短训练结果只用于确认训练链路，尚未证明精度。
 
 原版论文介绍、作者及使用说明保留在 [README_UPSTREAM.md](README_UPSTREAM.md)。
+
+## LiDAR 推荐使用流程
+
+完整数据、预训练下载/转换、单机多卡、多机、建图验证和冻结定位命令见
+[完整 nuScenes 分阶段训练指南](docs/lidar_full_training.md)。
+以下是当前实现和训练选择的摘要，后续原有章节主要记录相机定位算法与历史实验。
+
+```text
+每帧点云 xyz/intensity/time_lag
+  → 0.1×0.1×0.2 m 体素化 → SparseEncoder → SECOND → SECONDFPN
+  → 地图坐标对齐 + adapter → 256×50×100 BEV
+      ├─ 建图：历史 query + 当前新 query → 向量 decoder → 地图折线/类别/实例 ID
+      └─ 定位：冻结 BEV → LocalizationNeck ↔ 带误差位置裁剪的先验地图
+                                      → SE(2) 候选评分 → 位姿修正
+```
+
+建图沿用原版 five-frame/span-ten 训练：GT 实例跨帧对应、位姿变换、MotionMLP、
+历史/新 query 拼接、逐帧建图损失及双向变换损失。每帧 BEV 独立提取，
+尚无历史 BEV 融合和长时记忆库。当前依赖 nuScenes GT 位姿进行跨帧对齐，并非无位姿 SLAM。
+地图类别为人行横道、分隔线、道路边界；地图坐标与点云坐标有明确的平面旋转适配。
+
+| 阶段 | 推荐设置 | 验收重点 |
+|---|---|---|
+| 前端初始化 | 官方 `lidar-only-seg.pth`，迁移 SparseEncoder + SECOND/FPN | 210 个张量形状、数值及覆盖率检查 |
+| 可选适配预热 | 冻结已加载前端，训练新 adapter 和地图头，先试 2 epoch | 折线/语义损失、默认阈值下的真实匹配 |
+| 多帧建图 | 五帧窗口；前端 LR 1e-5，新模块 1e-4；先试 24 epoch | val AP/IoU、有效实例、历史传播与地图稳定性 |
+| 冻结 BEV 定位 | 选择建图权重；仅训练定位头，先试 12 epoch | 正确点云优于错配与零修正；BEV 参数及 BN 不变 |
+
+上述 epoch 是完整数据的建议起点，不是已验证的最优超参数。
+预训练模型的多 sweep 输入与我们当前单 sweep 仍有差异；加载权重后需要微调。
+本机小范围与完整数据配置现均使用官方体素尺寸，分别对应 `[384,640,41]` 与
+`[1024,1024,41]` 稀疏网格；之前 0.2 m 实验的结果保留，不作为新设置成绩。
+
+| 配置/工具 | 用途 |
+|---|---|
+| [五帧 mini](plugin/configs/lidar_mapping/nuscenes_lidar_mapping_5frame_mini.py) | 单卡小范围管线与学习验证 |
+| [完整数据建图](plugin/configs/lidar_mapping/nuscenes_lidar_mapping_full.py) | 官方范围、多卡预算、预训练前端初始化 |
+| [冻结定位 mini](plugin/configs/bev_localization/nuscenes_lidar_localization_frozen_mini.py) | 建图权重迁移与冻结状态验证 |
+| [完整数据冻结定位](plugin/configs/bev_localization/nuscenes_lidar_localization_frozen_full.py) | 只训练定位分支，使用真实地图裁剪 |
+| [权重转换](tools/mapping/convert_bevfusion_checkpoint.py) | 显式键名映射，不默默忽略前端缺失权重 |
+| [轨迹标签生成](tools/mapping/prepare_lidar_tracks.py) | 原版几何匹配，生成独立 LiDAR GT 轨迹 |
+
+快速单卡训练（环境和 mini 数据准备完毕、LiDAR 轨迹标签已生成后）：
+
+```bash
+python tools/train.py \
+  plugin/configs/lidar_mapping/nuscenes_lidar_mapping_5frame_mini.py \
+  --work-dir work_dirs/lidar_mapping_5frame_0p1 \
+  --no-validate --seed 0 \
+  --cfg-options load_from=work_dirs/pretrained_ckpts/lidar-only-seg-maptracker.pth \
+  log_config.interval=10
+```
+
+这里必须先按训练指南下载并转换官方权重；原始 BEVFusion 文件不能直接作为
+MapTracker 的完整 checkpoint 加载。数据、权重、实验输出均不提交到 Git。
+8 卡启动采用 `python -m torch.distributed.run --standalone --nproc_per_node=8 ... --launcher pytorch`，
+完整配置按 `WORLD_SIZE` 和实际训练帧数计算 epoch 对应的 iter。
+
+已验证官方前端权重映射、新体素五帧反传、单卡 DDP 训练入口及冻结定位状态不变。
+尚未验证完整 trainval 长期精度和实际多 GPU/多机训练；短训练通过不代表地图或定位已可用。
 
 ## 1. 相比原版 MapTracker的改动
 
 | 部分 | 原版 MapTracker | 当前定位分支 |
 |---|---|---|
-| 主要任务 | 多帧一致性向量 HD 建图 | 增加图像 BEV 与先验地图的局部 x/y/yaw 定位 |
-| 观测特征 | 图像主干、BEV 编码、时序记忆 | 复用 BEV 编码，新增 `LocalizationNeck` 输出匹配描述子 |
+| 主要任务 | 多帧一致性向量 HD 建图 | LiDAR 在线建图，以及观测 BEV 与先验地图的局部 x/y/yaw 定位 |
+| 观测特征 | 图像主干、BEV 编码、时序记忆 | 增加 LiDAR 前端，统一 BEV 接口；定位 neck 输出匹配描述子 |
 | 先验地图 | 地图用于建图监督 | 新增 `RasterMapEncoder`，编码三通道语义地图作为定位输入 |
 | 位姿估计 | 原建图任务不提供此地图匹配分支 | `SE2TemplateMatcher` 枚举候选，输出 MAP/均值位姿、协方差、熵等 |
 | 定位监督 | 无此定位损失 | 软标签候选交叉熵及位姿回归损失 |
@@ -451,16 +524,20 @@ confidence 目前由熵计算，尚不是校准后的成功概率。
 
 ## 7. 下一步工作
 
-1. 完成真实裁剪协议下的 mini-train 微调，并与旧权重在相同固定 mini-val 对比。
-2. 可视化 `scene-0916` 的失败帧，增加同场景不同位置的困难错配及边界影响对照。
-3. 验证非网格连续扰动、局部位姿细化和可信的拒绝更新机制。
-4. 定位验证稳定后，再解冻共享 BEV、恢复建图损失，验证联合训练。
+1. 在相同 0.1 m 网格上比较随机与官方 LiDAR 预训练初始化，验证真实历史匹配和 mini-val 地图质量。
+2. 按完整数据指南在服务器进行多卡建图训练，选择验证集效果更好的权重。
+3. 冻结该 BEV 训练定位，完成真实裁剪、错配点云和零修正对照。
+4. 验证连续扰动、拒绝更新与实际地图泛化，再考虑解冻 BEV 的双任务联合训练。
 
 现有接口允许定位与建图使用同一 BEV，但仅修改 `freeze_bev` / `detach_bev`
 并不等于完成联合训练；还需要恢复建图分支、配置损失并进行双任务评估。
 
 ## 8. 文档与原版功能
 
+- [完整 nuScenes：预训练、多卡建图、冻结 BEV 定位](docs/lidar_full_training.md)
+- [LiDAR 纯建图训练、在线推理与评估](docs/lidar_online_mapping.md)
+- [LiDAR 历史 query：原版多帧监督、训练与验证](docs/lidar_history_queries.md)
+- [BEVFusion LiDAR 前端、源码对照与训练验证](docs/lidar_frontend.md)
 - [定位 quickstart 与固定评估协议](docs/localization_quickstart.md)
 - [特征级扰动实验记录](docs/localization_mini_val_20260916.md)
 - [真实地图裁剪、坐标约定与训练命令](docs/localization_real_crop.md)

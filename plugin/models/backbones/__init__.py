@@ -1,1 +1,2 @@
 from .bevformer_backbone import BEVFormerBackbone
+from .bevfusion_lidar import BEVFusionLidarBackbone

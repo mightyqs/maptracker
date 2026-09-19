@@ -75,6 +75,11 @@ class NuscDataset(BaseMapDataset):
         total_samples = 0
         for scene_name, info in data.items():
             total_samples += len(info['sample_ids'])
+            if 'sample_tokens' in info:
+                actual = [self.samples[i]['token'] for i in info['sample_ids']]
+                if actual != info['sample_tokens'] or any(
+                        self.samples[i]['scene_name'] != scene_name for i in info['sample_ids']):
+                    raise ValueError('GT tracks do not match annotation tokens/scenes')
         assert total_samples == len(self.samples), 'Matching info not matched with data samples'
         self.matching_meta = data
         print(f'loaded matching meta for {len(data)} scenes')
@@ -153,6 +158,8 @@ class NuscDataset(BaseMapDataset):
 
 
         input_dict = {
+            'lidar_path': sample.get('lidar_path'),
+            'raw_ego2global_translation': sample['e2g_translation'],
             'location': location,
             'token': sample['token'],
             'img_filenames': [c['img_fpath'] for c in sample['cams'].values()],

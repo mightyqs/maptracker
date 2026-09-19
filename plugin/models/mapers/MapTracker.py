@@ -43,6 +43,8 @@ class MapTracker(BaseMapper):
                  mem_len=None,
                  mem_warmup_iters=-1,
                  localization_only=False,
+                 lidar_online_mapping=False,
+                 mapping_score_thresholds=None,
                  **kwargs):
         super().__init__()
 
@@ -79,6 +81,10 @@ class MapTracker(BaseMapper):
             build_head(localization_cfg) if localization_cfg is not None else None
         )
         self.localization_only = localization_only
+        self.freeze_mapping_for_localization = bool(
+            kwargs.pop('freeze_mapping_for_localization', False))
+        if self.freeze_mapping_for_localization and not (localization_only and freeze_bev):
+            raise ValueError('Frozen mapping localization requires localization_only and freeze_bev')
         if self.localization_only and self.localization_head is None:
             raise ValueError('localization_only=True requires localization_cfg')
         
@@ -96,6 +102,19 @@ class MapTracker(BaseMapper):
         else:
             self.test_time_history_steps = test_time_history_steps
         self.mem_select_dist_ranges = mem_select_dist_ranges
+        self.lidar_frontend = getattr(self.backbone, 'single_frame_only', False)
+        self.lidar_online_mapping = bool(lidar_online_mapping)
+        self.single_frame_only = self.lidar_frontend and not self.lidar_online_mapping
+        self.mapping_score_thresholds = dict(first=0.4, new=0.6, track=0.5)
+        if mapping_score_thresholds is not None:
+            self.mapping_score_thresholds.update(mapping_score_thresholds)
+        if self.lidar_online_mapping and (
+                not self.lidar_frontend or use_memory or skip_vector_head or
+                not history_steps or not self.test_time_history_steps):
+            raise ValueError('LiDAR online mapping requires a LiDAR frontend, vector head, '
+                             'positive history steps and use_memory=False')
+        if self.single_frame_only and (use_memory or history_steps or test_time_history_steps):
+            raise ValueError('This LiDAR frontend requires history_steps=0 and use_memory=False')
 
         # vector instance memory module
         if self.use_memory:
@@ -352,7 +371,22 @@ class MapTracker(BaseMapper):
         return all_history_curr2prev, all_history_prev2curr, all_history_coord
         
 
-    def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
+    def extract_observation_bev(self, img=None, img_metas=None, points=None,
+                                timestep=0, history_bev_feats=None,
+                                history_img_metas=None, all_history_coord=None,
+                                img_backbone_gradient=True):
+        """Shared camera/LiDAR path for training, inference and paired evaluation."""
+        if self.lidar_online_mapping:
+            # History poses remain available to vector-query propagation, but
+            # each LiDAR BEV is encoded independently (no temporal BEV fusion).
+            history_bev_feats, history_img_metas, all_history_coord = [], [], []
+        bev, _ = self.backbone(
+            img, img_metas, timestep, history_bev_feats or [],
+            history_img_metas or [], all_history_coord or [], points=points,
+            img_backbone_gradient=img_backbone_gradient)
+        return self.neck(bev)
+
+    def forward_train(self, img=None, vectors=None, semantic_mask=None, points=None, img_metas=None, all_prev_data=None,
                       all_local2global_info=None, localization_map=None,
                       localization_target_pose=None, **kwargs):
         '''
@@ -371,19 +405,30 @@ class MapTracker(BaseMapper):
             loss, log_vars, num_sample
         '''
         #  prepare labels and images
+        if img is None and (points is None or len(points) == 0):
+            raise ValueError('Provide image or LiDAR observations')
+        if self.single_frame_only and all_prev_data:
+            raise ValueError('LiDAR history loading is not supported yet')
+        device = img.device if img is not None else points[0].device
         gts, img, img_metas, valid_idx, points = self.batch_data(
-            vectors, img, img_metas, img.device, points)
-        bs = img.shape[0]
+            vectors, img, img_metas, device, points)
+        bs = len(img_metas)
 
         _use_memory = self.use_memory and self.num_iter > self.mem_warmup_iters
         
         if all_prev_data is not None:
             num_prev_frames = len(all_prev_data)        
             all_gts_prev, all_img_prev, all_img_metas_prev, all_semantic_mask_prev  = [], [], [], []
+            all_points_prev = []
+            if num_prev_frames and (all_local2global_info is None or
+                                    len(all_local2global_info) != num_prev_frames + 1):
+                raise ValueError('Multi-frame training requires GT instance IDs for every frame')
             for prev_data in all_prev_data:
-                gts_prev, img_prev, img_metas_prev, valid_idx_prev, _ = self.batch_data(
-                    prev_data['vectors'], prev_data['img'], prev_data['img_metas'], img.device      
+                gts_prev, img_prev, img_metas_prev, valid_idx_prev, points_prev = self.batch_data(
+                    prev_data['vectors'], prev_data.get('img'), prev_data['img_metas'],
+                    device, prev_data.get('points')
                 )
+                all_points_prev.append(points_prev)
                 all_gts_prev.append(gts_prev)
                 all_img_prev.append(img_prev)
                 all_img_metas_prev.append(img_metas_prev)
@@ -391,7 +436,8 @@ class MapTracker(BaseMapper):
         else:
             num_prev_frames = 0
 
-        assert points is None
+        if points is not None and not self.lidar_frontend:
+            raise ValueError('Current camera backbone does not consume LiDAR points')
 
         if self.skip_vector_head:
             backprop_backbone_ids = [0, num_prev_frames] # first and last frame train the backbone (bev pretrain)
@@ -402,6 +448,7 @@ class MapTracker(BaseMapper):
         all_loss_dict_prev = []
         all_trans_loss = []
         all_outputs_prev = []
+        temporal_stats = {}
 
         self.tracked_query_length = {}
 
@@ -423,12 +470,10 @@ class MapTracker(BaseMapper):
             all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
                     self.process_history_info(all_img_metas_prev[t], history_img_metas)
 
-            _bev_feats, mlvl_feats = self.backbone(all_img_prev[t], all_img_metas_prev[t], t, history_bev_feats, 
-                        history_img_metas, all_history_coord, points=None, 
-                        img_backbone_gradient=img_backbone_gradient)
-
-            # Neck for prev
-            bev_feats = self.neck(_bev_feats)
+            bev_feats = self.extract_observation_bev(
+                all_img_prev[t], all_img_metas_prev[t], all_points_prev[t], t,
+                history_bev_feats, history_img_metas, all_history_coord,
+                img_backbone_gradient)
 
             if _use_memory:
                 self.memory_bank.curr_t = t
@@ -502,6 +547,10 @@ class MapTracker(BaseMapper):
                 track_query_info = self.prepare_track_queries_and_targets(gts_next, prev_inds_list, 
                     prev_gt_inds_list, prev_matched_reg_cost, prev_gt_list, outputs_prev, gt_cur2prev, gt_prev2cur, 
                     img_metas_prev, _use_memory, pos_th=pos_th, timestep=t)
+                temporal_stats[f'track_queries_t{t}'] = sum(
+                    len(info['track_query_hs_embeds']) for info in track_query_info) / bs
+                temporal_stats[f'track_matches_t{t}'] = sum(
+                    len(info['track_query_match_ids']) for info in track_query_info) / bs
             else:
                 loss_dict_prev = {}
 
@@ -519,10 +568,9 @@ class MapTracker(BaseMapper):
 
         all_history_curr2prev, all_history_prev2curr, all_history_coord = self.process_history_info(img_metas, history_img_metas)
 
-        _bev_feats, mlvl_feats = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
-                    points=None, img_backbone_gradient=img_backbone_gradient)
-        # Neck for curr
-        bev_feats = self.neck(_bev_feats)
+        bev_feats = self.extract_observation_bev(
+            img, img_metas, points, num_prev_frames, history_bev_feats,
+            history_img_metas, all_history_coord, img_backbone_gradient)
 
         if self.skip_vector_head or num_prev_frames == 0:
             # Transform prev-frame feature & pts to curr frame using the relative pose
@@ -656,28 +704,36 @@ class MapTracker(BaseMapper):
             log_vars.update(log_vars_t)
         
         log_vars.update({'total': loss.item()})
-        num_sample = img.size(0)
+        log_vars.update(temporal_stats)
+        num_sample = bs
         return loss, log_vars, num_sample
 
     @torch.no_grad()
-    def forward_test(self, img, points=None, img_metas=None, seq_info=None,
+    def forward_test(self, img=None, points=None, img_metas=None, seq_info=None,
                      semantic_mask=None, localization_map=None,
                      localization_target_pose=None, **kwargs):
         '''
             inference pipeline
         '''
 
-        assert img.shape[0] == 1, 'Only support bs=1 per-gpu for inference'
+        assert len(img_metas) == 1, 'Only support bs=1 per-gpu for inference'
 
         tokens = []
         for img_meta in img_metas:
             tokens.append(img_meta['token'])
         
         scene_name, local_idx, seq_length  = seq_info[0]
-        first_frame = (local_idx == 0)
+        if self.lidar_online_mapping and local_idx != 0:
+            previous = getattr(self, '_lidar_online_previous', None)
+            if previous != (scene_name, local_idx - 1):
+                raise ValueError('Online LiDAR inference must start at scene frame 0 '
+                                 'and consume consecutive frames in order')
+        first_frame = (local_idx == 0) or self.single_frame_only
         img_metas[0]['local_idx'] = local_idx
     
         if first_frame:
+            if self.lidar_online_mapping:
+                self.head.clear_temporal_cache()
             if self.use_memory:
                 self.memory_bank.set_bank_size(self.test_time_history_steps)
                 #self.memory_bank.set_bank_size(self.mem_len)
@@ -695,12 +751,9 @@ class MapTracker(BaseMapper):
         all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
                     self.process_history_info(img_metas, history_img_metas)
 
-        _bev_feats, mlvl_feats = self.backbone(img, img_metas, local_idx, history_bev_feats, history_img_metas,
-                        all_history_coord, points=points)
-        
-        img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
-        # Neck
-        bev_feats = self.neck(_bev_feats)
+        bev_feats = self.extract_observation_bev(
+            img, img_metas, points, local_idx, history_bev_feats,
+            history_img_metas, all_history_coord)
 
         localization_outputs = None
         if self.localization_head is not None and self.localization_head.require_prior_map and localization_map is None:
@@ -753,9 +806,16 @@ class MapTracker(BaseMapper):
         
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if self.use_memory else None
-            thr_det = 0.4 if first_frame else 0.6
-            pos_results = self.head.prepare_temporal_propagation(preds_dict, scene_name, local_idx, 
-                                        memory_bank, thr_track=0.5, thr_det=thr_det)
+            thr_det = self.mapping_score_thresholds['first' if first_frame else 'new']
+            pos_results = self.head.prepare_temporal_propagation(preds_dict, scene_name,
+                                        0 if self.single_frame_only else local_idx,
+                                        memory_bank, thr_track=self.mapping_score_thresholds['track'],
+                                        thr_det=thr_det)
+            if self.single_frame_only:
+                # Format per-frame detections without retaining track/query state.
+                # IDs here are frame-local, not online instance associations.
+                pos_results['local_idx'] = local_idx
+                self.head.clear_temporal_cache()
     
         if not self.skip_vector_head:
             results_list = self.head.post_process(preds_dict, tokens, track_dict)
@@ -784,6 +844,8 @@ class MapTracker(BaseMapper):
                     self.localization_head.result_for_sample(localization_outputs, b_i)
                 )
 
+        if self.lidar_online_mapping:
+            self._lidar_online_previous = (scene_name, local_idx)
         return results_list
 
     def batch_data(self, vectors, imgs, img_metas, device, points=None):
@@ -936,7 +998,7 @@ class MapTracker(BaseMapper):
             not_prev_out_ind = torch.tensor([
                 ind.item()
                 for ind in not_prev_out_ind
-                if ind not in prev_out_ind and ind < pad_bound])
+                if ind not in prev_out_ind and ind < pad_bound], device=device, dtype=torch.long)
             
             # Get all non-matched pred with >0.5 conf score, serve as FP
             neg_scores = scores[not_prev_out_ind]
@@ -952,7 +1014,7 @@ class MapTracker(BaseMapper):
 
             false_out_ind = not_prev_out_ind[fp_select_mask]
 
-            prev_out_ind_final = torch.tensor(prev_out_ind_filtered.tolist() + false_out_ind.tolist()).long()
+            prev_out_ind_final = torch.cat([prev_out_ind_filtered, false_out_ind]).long().to(device)
             target_ind_matching = torch.cat([
                 target_ind_matching,
                 torch.tensor([False, ] * len(false_out_ind)).bool().to(device)
@@ -1026,6 +1088,15 @@ class MapTracker(BaseMapper):
             self._freeze_bev()
         else:
             self._unfreeze_bev()
+        if getattr(self.backbone, 'freeze_encoder', False):
+            self.backbone.train(self.training)
+        if self.freeze_mapping_for_localization:
+            # Fixed BEV means fixed BN statistics as well as fixed parameters.
+            for module in (self.backbone, self.neck, self.head, self.seg_decoder,
+                           self.query_propagate):
+                module.requires_grad_(False)
+                module.eval()
+        return self
 
     def eval(self):
         super().eval()

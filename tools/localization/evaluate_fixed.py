@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Paired, fixed-perturbation evaluation of the single-frame localization head.
 
-Wrong images are complete six-camera observations from a different scene,
-encoded with their OWN camera geometry. Only the cached observation descriptor
+Wrong observations are complete six-camera images or LiDAR scans from a different
+scene, encoded with their OWN geometry. Only the cached observation descriptor
 is swapped; map, perturbation, and localization target are unchanged.
 """
 import argparse
@@ -133,7 +133,8 @@ def main():
     if cfg.get('fp16') is not None:
         raise ValueError('This evaluator currently uses FP32 only')
     cfg.model.pretrained = None
-    cfg.model.backbone_cfg.img_backbone.pretrained = None
+    if 'img_backbone' in cfg.model.backbone_cfg:
+        cfg.model.backbone_cfg.img_backbone.pretrained = None
     dataset_cfg = cfg.data.val.copy()
     dataset_cfg.update(test_mode=True, multi_frame=False, matching=False)
     dataset = build_dataset(dataset_cfg)
@@ -177,6 +178,8 @@ def main():
                   yaw_threshold_deg=args.yaw_threshold,
                   protocol=f'{map_source} map SE2; cross-scene observation swap with donor geometry',
                   semantic_protocol='aligned-map reconstruction and aligned BEV diagnostics',
+                  observation_modality=('lidar' if getattr(model.backbone, 'single_frame_only', False)
+                                        else 'camera'),
                   checkpoints=[])
     model.cuda().eval()
     for checkpoint_index, checkpoint in enumerate(args.checkpoints):
@@ -190,12 +193,12 @@ def main():
         with torch.no_grad():
             for index in range(len(dataset)):
                 sample = dataset[index]
-                image = sample['img'].data.unsqueeze(0).cuda()
+                image = sample['img'].data.unsqueeze(0).cuda() if 'img' in sample else None
+                points = [sample['points'].data.cuda()] if 'points' in sample else None
                 metas = [sample['img_metas'].data]
                 # Identical no-history backbone + neck path and raster orientation
                 # to MapTracker.forward_test; skip unused map/vector decoders.
-                bev, _ = model.backbone(image, metas, 0, [], [], [], points=None)
-                bev = model.neck(bev)
+                bev = model.extract_observation_bev(image, metas, points=points)
                 raster = sample['semantic_mask'].data.unsqueeze(0).cuda().flip(2)
                 observation = head.localization_neck(bev)
                 map_features = head.map_encoder(raster, output_size=observation.shape[-2:])
